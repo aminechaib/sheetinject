@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "SheetInject — Excel to Web Form Injector",
+  "version": "1.3.0",
+  "description": "Smartly scan multi-row and virtualized web tables, harvest dropdown/combobox lists, export ready-to-fill Excel templates, and inject up to 600+ rows directly into the DOM.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open SheetInject",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
