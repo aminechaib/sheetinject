@@ -15,6 +15,11 @@ chrome.action.onClicked.addListener(async (tab) => {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
+      world: 'MAIN',
+      files: ['lib/react_bridge.js']
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
       files: ['lib/xlsx.mini.min.js', 'content.js']
     });
   } catch (err) {

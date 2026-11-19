@@ -27,6 +27,35 @@
     return false;
   });
 
+  const DEFAULT_REACT_CONFIG = {
+    anchorSelector: 'textarea[data-testid^="textarea-description-"]',
+    rowsProp: 'rows',
+    updateRowProp: 'updateRow',
+    countriesProp: 'countries',
+    fetchSousProp: 'fetchSousPositions',
+    sousPositionsProp: 'sousPositionsData',
+    selectSousProp: 'onSelectSousPosition',
+    sousPositionKey: 'sousPosition',
+    subCategoryKey: 'subCategoryCode',
+    idField: 'id',
+    idHeaderLabels: 'id, rowid, row id',
+    categoryField: 'categoryCode',
+    subCategoryField: 'subCategoryCode',
+    sousPositionField: 'sousPosition',
+    countryExportField: 'countryOfExport',
+    countryImportField: 'countryOfOrigin',
+    aliasesText: [
+      'categoryCode: input1, category, category code, البند التعريفي',
+      'subCategoryCode: input2, sub category, subcategory, sub category code, subcategory code, sous position, sousposition, البند التعريفي الفرعي',
+      'productDescription: textarea, description, product description, تسمية المنتج',
+      'unit: unit, الوحدة',
+      'countryOfOrigin: origin index, originindex, country of origin, بلد المنشأ',
+      'countryOfExport: countries, country of export, البلد المورد',
+      'quantity: value1, quantity, qty, الكمية المطلوب استرادها',
+      'price: value2, price, unit price, سعر الوحدة بالدولار'
+    ].join('\n')
+  };
+
   // --- State ---
   const state = {
     workbook: null,
@@ -38,6 +67,8 @@
     rowSelector: '',
     addRowSelector: '',
     mappings: {}, // { [excelHeader]: selectorOrTemplate }
+    reactColumnModes: {}, // { [excelHeader]: 'react' | 'simulated' }
+    reactConfig: { ...DEFAULT_REACT_CONFIG },
     pace: 'balanced', // 'instant' | 'balanced' | 'safe'
     injectionMode: 'simulated',
     startRowOffset: 0,
@@ -59,6 +90,7 @@
   };
 
   const STORAGE_KEY = 'sheetinject_v2_profile_' + location.hostname;
+  const REACT_STORAGE_KEY = 'sheetinject_v2_react_' + location.hostname;
   const COMBOBOX_SEL = '[role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="dialog"]';
   const FORM_CONTROL_SEL = 'input:not([type="file"]):not([type="hidden"]):not([role="searchbox"]), select, textarea, [contenteditable="true"], ' + COMBOBOX_SEL;
 
@@ -1503,6 +1535,199 @@
     return { ok: false, warn: 'Unsupported element' };
   }
 
+  function reactAliases() {
+    const text = String(state.reactConfig.aliasesText || '');
+    const parsed = text.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const idx = line.indexOf(':');
+        if (idx < 0) return null;
+        const field = line.slice(0, idx).trim();
+        if (!field) return null;
+        const labels = line.slice(idx + 1).split(',').map((v) => v.trim()).filter(Boolean);
+        return labels.length ? { field, labels: labels.map(normalizeLoose) } : null;
+      })
+      .filter(Boolean);
+
+    return parsed.length ? parsed : DEFAULT_REACT_CONFIG.aliasesText.split(/\r?\n/).map((line) => {
+      const idx = line.indexOf(':');
+      return {
+        field: line.slice(0, idx).trim(),
+        labels: line.slice(idx + 1).split(',').map((v) => normalizeLoose(v.trim())).filter(Boolean)
+      };
+    });
+  }
+
+  function reactFieldName(header) {
+    const raw = String(header || '').trim();
+    const key = normalizeLoose(raw);
+    const hit = reactAliases().find((entry) => entry.labels.includes(key));
+    return hit ? hit.field : raw;
+  }
+
+  let reactRequestSeq = 0;
+
+  function reactBridge(action, payload, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (!document.documentElement.hasAttribute('data-si-react-bridge')) {
+        reject(new Error('React bridge not injected — reload extension and refresh tab'));
+        return;
+      }
+
+      const id = 'si_' + Date.now() + '_' + ++reactRequestSeq;
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', onResponse);
+        reject(new Error('React bridge timeout (' + action + ')'));
+      }, timeoutMs || 12000);
+
+      function onResponse(event) {
+        if (event.source !== window) return;
+        const detail = event.data;
+        if (!detail || detail.siReactResponse !== true || detail.id !== id) return;
+        clearTimeout(timer);
+        window.removeEventListener('message', onResponse);
+        resolve(detail.result || { ok: false, warn: 'empty bridge response' });
+      }
+
+      window.addEventListener('message', onResponse);
+      window.postMessage({ siReactRequest: true, id, action, config: { ...state.reactConfig }, ...payload }, '*');
+    });
+  }
+
+  function reactDomRowId(targetDomIndex) {
+    const selectors = Object.values(state.mappings).filter((sel) => sel && hasIndexPlaceholder(sel));
+    const candidates = selectors.map((sel) => resolveIndexedSelector(sel, targetDomIndex));
+    candidates.push('[data-testid$="-' + (targetDomIndex + 1) + '"]');
+
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      for (const attr of ['data-testid', 'id', 'name']) {
+        const val = el.getAttribute(attr);
+        const m = val && /(?:^|[-_.])(\d+)$/.exec(val);
+        if (m) return Number(m[1]);
+      }
+    }
+    return null;
+  }
+
+  function reactFieldKey(header, fields) {
+    const alias = reactFieldName(header);
+    const list = Array.isArray(fields) ? fields : [];
+    if (list.includes(alias)) return alias;
+    const hNorm = normalizeLoose(header).replace(/\s/g, '');
+    const match = list.find((k) => normalizeLoose(k).replace(/\s/g, '') === hNorm);
+    return match || alias;
+  }
+
+  async function reactUpdateField(rowId, field, value) {
+    const res = await reactBridge('update', { rowId, field, value });
+    await waitMs(10);
+    return Boolean(res.ok && (res.value === null || res.value === String(value ?? '')));
+  }
+
+  function isSimulatedColumn(header) {
+    return state.reactColumnModes[header] === 'simulated';
+  }
+
+  async function injectMappedColumn(header, value, targetDomIndex, rowScope) {
+    const rawSel = state.mappings[header];
+    if (!rawSel) return { ok: false, warn: 'no mapped control' };
+
+    let el = null;
+    if (hasIndexPlaceholder(rawSel)) {
+      el = document.querySelector(resolveIndexedSelector(rawSel, targetDomIndex));
+    } else if (rowScope) {
+      el = rowScope.querySelector(rawSel);
+    }
+    if (!el) return { ok: false, warn: 'mapped control not found' };
+
+    return injectValue(el, String(value ?? ''));
+  }
+
+  async function injectReactRow(rowData, targetDomIndex, ownerInfo, rowScope) {
+    const warnings = [];
+    let written = 0;
+    const cfg = state.reactConfig;
+
+    const idHeader = Object.keys(rowData).find((h) =>
+      cfg.idHeaderLabels.split(',').map((v) => normalizeText(v.trim())).includes(normalizeText(h)));
+    let rowId = idHeader ? Number(rowData[idHeader]) : reactDomRowId(targetDomIndex);
+    if (!Number.isFinite(rowId)) rowId = targetDomIndex + 1;
+
+    const entries = Object.entries(rowData).filter(([h]) => String(h || '').trim() && h !== idHeader);
+    const fieldOf = (h) => reactFieldKey(h, ownerInfo.fields);
+    const categoryEntry = entries.find(([h]) => fieldOf(h) === cfg.categoryField);
+    const subEntry = entries.find(([h]) => [cfg.subCategoryField, cfg.sousPositionField].includes(fieldOf(h)));
+
+    if (categoryEntry) {
+      const res = isSimulatedColumn(categoryEntry[0])
+        ? await injectMappedColumn(categoryEntry[0], categoryEntry[1], targetDomIndex, rowScope)
+        : { ok: await reactUpdateField(rowId, cfg.categoryField, categoryEntry[1]) };
+      if (res.ok) written++;
+      else warnings.push(categoryEntry[0] + ': ' + (res.warn || 'updateRow did not apply'));
+    }
+
+    if (subEntry && isSimulatedColumn(subEntry[0])) {
+      const res = await injectMappedColumn(subEntry[0], subEntry[1], targetDomIndex, rowScope);
+      if (res.ok) written++;
+      else warnings.push(subEntry[0] + ': ' + (res.warn || 'not filled'));
+    } else if (subEntry && ownerInfo.fetch && ownerInfo.select) {
+      const fetched = await reactBridge('fetchSous', { rowId, category: categoryEntry ? categoryEntry[1] : '' });
+      if (!fetched.ok) warnings.push(subEntry[0] + ': ' + fetched.warn);
+
+      const deadline = Date.now() + 10000;
+      let found = false;
+      while (Date.now() < deadline) {
+        const res = await reactBridge('options', { rowId }, 3000);
+        if (res.ok && (res.options || []).some((item) =>
+          String(item[state.reactConfig.sousPositionKey] ?? item[state.reactConfig.subCategoryKey] ?? '') === String(subEntry[1]))) {
+          found = true;
+          break;
+        }
+        await waitMs(100);
+      }
+
+      if (found) {
+        const res = await reactBridge('selectSous', { rowId, sousPosition: subEntry[1] });
+        if (res.ok) {
+          written++;
+          await waitMs(10);
+        } else {
+          warnings.push(subEntry[0] + ': ' + res.warn);
+        }
+      } else {
+        warnings.push(subEntry[0] + ': sous-position not found');
+      }
+    }
+
+    for (const [header, rawVal] of entries) {
+      const field = fieldOf(header);
+      if (field === cfg.categoryField || field === cfg.subCategoryField || field === cfg.sousPositionField) continue;
+
+      let val = rawVal == null ? '' : String(rawVal);
+      if ([cfg.countryExportField, cfg.countryImportField].includes(field)) {
+        const parts = val.split(',').map((v) => v.trim()).filter(Boolean);
+        if (parts.length > 1 && parts.every((v) => /^\d+$/.test(v))) {
+          const res = await reactBridge('countryCodes', { codes: val });
+          if (res.ok) val = res.codes;
+        } else if (/^\d+$/.test(val)) {
+          const res = await reactBridge('countryCode', { code: val });
+          if (res.ok) val = res.code;
+        }
+      }
+
+      const res = isSimulatedColumn(header)
+        ? await injectMappedColumn(header, val, targetDomIndex, rowScope)
+        : { ok: await reactUpdateField(rowId, field, val) };
+      if (res.ok) written++;
+      else warnings.push(header + ': ' + (res.warn || 'updateRow did not apply'));
+    }
+
+    return { written, warnings };
+  }
+
   function addLog(text, level) {
     state.logs.unshift({ text, level: level || 'ok' });
     if (state.logs.length > 60) state.logs.length = 60;
@@ -1588,8 +1813,9 @@
   }
 
   async function runInjection(limitCount) {
+    const isReactMode = state.injectionMode === 'react';
     const rawMapped = Object.entries(state.mappings).filter(([, sel]) => Boolean(sel));
-    if (rawMapped.length === 0 || state.rows.length === 0) return;
+    if ((!isReactMode && rawMapped.length === 0) || state.rows.length === 0) return;
     const mappedEntries = orderEntriesByDependency(rawMapped);
 
     state.isRunning = true;
@@ -1599,6 +1825,18 @@
     const total = limitCount ? Math.min(state.rows.length, limitCount) : state.rows.length;
     state.progress = { current: 0, total, ok: 0, warn: 0, err: 0, elapsedMs: 0 };
     render();
+
+    let reactOwnerInfo = null;
+    if (isReactMode) {
+      try {
+        const res = await reactBridge('inspect');
+        if (!res.ok) throw new Error(res.warn);
+        reactOwnerInfo = res;
+        addLog('React owner: ' + res.rows + ' rows [' + (res.fields || []).join(', ') + ']', 'ok');
+      } catch (err) {
+        addLog('React owner: ' + err.message, 'err');
+      }
+    }
 
     // Locate virtual scroll container once if present
     const firstProbe = mappedEntries.find(([, sel]) => hasIndexPlaceholder(sel));
@@ -1620,13 +1858,15 @@
       }
 
       const targetDomIndex = state.startRowOffset + i;
-      const ensure = await ensureRowExistsForIndex(targetDomIndex, mappedEntries, scrollContainer);
-      if (!ensure.ok) {
-        state.progress.err++;
-        addLog('Row ' + (i + 1) + ': ' + ensure.reason, 'err');
-        state.progress.current = i + 1;
-        renderProgressOnly();
-        continue;
+      if (!isReactMode) {
+        const ensure = await ensureRowExistsForIndex(targetDomIndex, mappedEntries, scrollContainer);
+        if (!ensure.ok) {
+          state.progress.err++;
+          addLog('Row ' + (i + 1) + ': ' + ensure.reason, 'err');
+          state.progress.current = i + 1;
+          renderProgressOnly();
+          continue;
+        }
       }
 
       const rowScope = state.rowSelector
@@ -1637,22 +1877,33 @@
       let rowWarnings = [];
       let written = 0;
 
-      for (const [header, rawSel] of mappedEntries) {
-        let el = null;
-        if (hasIndexPlaceholder(rawSel)) {
-          const resolvedSel = resolveIndexedSelector(rawSel, targetDomIndex);
-          el = document.querySelector(resolvedSel);
-        } else {
-          el = rowScope.querySelector(rawSel);
+      if (isReactMode) {
+        try {
+          if (!reactOwnerInfo) throw new Error('React owner not available');
+          const res = await injectReactRow(rowData, targetDomIndex, reactOwnerInfo, rowScope);
+          written = res.written;
+          rowWarnings = res.warnings;
+        } catch (err) {
+          rowWarnings.push(err.message);
         }
+      } else {
+        for (const [header, rawSel] of mappedEntries) {
+          let el = null;
+          if (hasIndexPlaceholder(rawSel)) {
+            const resolvedSel = resolveIndexedSelector(rawSel, targetDomIndex);
+            el = document.querySelector(resolvedSel);
+          } else {
+            el = rowScope.querySelector(rawSel);
+          }
 
-        if (!el) {
-          rowWarnings.push(header + ' missing');
-          continue;
+          if (!el) {
+            rowWarnings.push(header + ' missing');
+            continue;
+          }
+          const res = await injectValue(el, rowData[header] ?? '');
+          if (res.ok) written++;
+          else if (res.warn) rowWarnings.push(header + ': ' + res.warn);
         }
-        const res = await injectValue(el, rowData[header] ?? '');
-        if (res.ok) written++;
-        else if (res.warn) rowWarnings.push(header + ': ' + res.warn);
       }
 
       if (rowWarnings.length > 0) {
@@ -1739,6 +1990,17 @@
     } catch (_e) {}
   }
 
+  function saveReactConfig() {
+    try {
+      chrome.storage.local.set({
+        [REACT_STORAGE_KEY]: {
+          reactColumnModes: state.reactColumnModes,
+          reactConfig: state.reactConfig
+        }
+      });
+    } catch (_e) {}
+  }
+
   function loadSavedMappings() {
     try {
       chrome.storage.local.get([STORAGE_KEY], (res) => {
@@ -1747,6 +2009,21 @@
           if (saved.rowSelector) state.rowSelector = saved.rowSelector;
           if (saved.addRowSelector) state.addRowSelector = saved.addRowSelector;
           if (saved.mappings) state.mappings = { ...saved.mappings };
+          render();
+        }
+      });
+      chrome.storage.local.get([REACT_STORAGE_KEY], (res) => {
+        const saved = res && res[REACT_STORAGE_KEY];
+        if (saved) {
+          if (saved.reactColumnModes) state.reactColumnModes = { ...saved.reactColumnModes };
+          if (saved.reactConfig) {
+            const cfg = { ...DEFAULT_REACT_CONFIG, ...saved.reactConfig };
+            cfg.aliasesText = String(cfg.aliasesText || '').replace(
+              'countryOfExport: origin index, originindex, country of export, بلد المنشأ\ncountryOfOrigin: countries, country of origin, البلد المورد',
+              'countryOfOrigin: origin index, originindex, country of origin, بلد المنشأ\ncountryOfExport: countries, country of export, البلد المورد'
+            );
+            state.reactConfig = cfg;
+          }
           render();
         }
       });
@@ -1993,10 +2270,12 @@
               <span>2. Drag Columns onto Inputs / Comboboxes</span>
               <button class="si-btn" id="si-automatch-btn" style="padding:3px 8px;font-size:11px;">Auto-Match</button>
             </div>
+            ${state.injectionMode === 'react' ? '<div class="si-muted" style="margin-bottom:6px;">Column method: React = updateRow · Human = type/click into page control</div>' : ''}
             <div class="si-col-list">
               ${state.headers.map((h) => {
                 const sample = state.rows[0] ? state.rows[0][h] : '';
                 const mapped = state.mappings[h];
+                const colMode = state.reactColumnModes[h] || 'react';
                 const isPicking = state.pickMode && state.pickMode.kind === 'column' && state.pickMode.header === h;
                 return `
                   <div class="si-col-row">
@@ -2004,6 +2283,12 @@
                       <span class="si-col-name">${escapeHtml(h)}</span>
                       <span class="si-col-sample">${mapped ? 'Mapped: ' + escapeHtml(mapped) : 'e.g. ' + escapeHtml(sample || 'empty')}</span>
                     </div>
+                    ${state.injectionMode === 'react' ? `
+                      <select class="si-select" data-col-mode="${escapeHtml(h)}" title="Injection method for this column" style="padding:3px 4px;font-size:10px;">
+                        <option value="react"${colMode === 'react' ? ' selected' : ''}>React</option>
+                        <option value="simulated"${colMode === 'simulated' ? ' selected' : ''}>Human</option>
+                      </select>
+                    ` : ''}
                     <button class="si-btn" data-col-pick="${escapeHtml(h)}" style="padding:5px 8px;font-size:11px;">${isPicking ? 'Click Page...' : 'Pick'}</button>
                     ${mapped ? '<button class="si-btn" data-col-clear="' + escapeHtml(h) + '" style="padding:5px 7px;font-size:11px;">×</button>' : ''}
                   </div>
@@ -2028,9 +2313,35 @@
                   <option value="simulated"${state.injectionMode === 'simulated' ? ' selected' : ''}>Simulated (human-like)</option>
                   <option value="native"${state.injectionMode === 'native' ? ' selected' : ''}>Direct + events (page state)</option>
                   <option value="raw"${state.injectionMode === 'raw' ? ' selected' : ''}>Raw value (no page state)</option>
+                  <option value="react"${state.injectionMode === 'react' ? ' selected' : ''}>React state (updateRow)</option>
                 </select>
-                <div class="si-muted" style="margin-top:2px;">Use Direct + events for React/virtualized tables and calculations.</div>
+                <div class="si-muted" style="margin-top:2px;">React state uses the page's updateRow method; Excel headers are used as field names.</div>
               </div>
+              ${state.injectionMode === 'react' ? `
+                <div style="grid-column:1/-1;border-top:1px solid #334155;padding-top:8px;">
+                  <div class="si-section-title"><span>React page hooks (editable)</span></div>
+                  <div class="si-grid-2">
+                    <div><span class="si-muted">Anchor selector</span><input class="si-input" data-react-config="anchorSelector" value="${escapeHtml(state.reactConfig.anchorSelector)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Rows prop</span><input class="si-input" data-react-config="rowsProp" value="${escapeHtml(state.reactConfig.rowsProp)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Update method</span><input class="si-input" data-react-config="updateRowProp" value="${escapeHtml(state.reactConfig.updateRowProp)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Countries prop</span><input class="si-input" data-react-config="countriesProp" value="${escapeHtml(state.reactConfig.countriesProp)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Fetch sous method</span><input class="si-input" data-react-config="fetchSousProp" value="${escapeHtml(state.reactConfig.fetchSousProp)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Sous positions prop</span><input class="si-input" data-react-config="sousPositionsProp" value="${escapeHtml(state.reactConfig.sousPositionsProp)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Select sous method</span><input class="si-input" data-react-config="selectSousProp" value="${escapeHtml(state.reactConfig.selectSousProp)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Option keys (sous / sub)</span><input class="si-input" id="si-react-option-keys" value="${escapeHtml(state.reactConfig.sousPositionKey + ', ' + state.reactConfig.subCategoryKey)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Row id field</span><input class="si-input" data-react-config="idField" value="${escapeHtml(state.reactConfig.idField)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Id header labels</span><input class="si-input" id="si-react-id-headers" value="${escapeHtml(state.reactConfig.idHeaderLabels)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Category field</span><input class="si-input" data-react-config="categoryField" value="${escapeHtml(state.reactConfig.categoryField)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Sub / sous fields</span><input class="si-input" id="si-react-sub-fields" value="${escapeHtml(state.reactConfig.subCategoryField + ', ' + state.reactConfig.sousPositionField)}" style="margin-top:2px;" /></div>
+                    <div><span class="si-muted">Export / import fields</span><input class="si-input" id="si-react-country-fields" value="${escapeHtml(state.reactConfig.countryExportField + ', ' + state.reactConfig.countryImportField)}" style="margin-top:2px;" /></div>
+                  </div>
+                  <div style="margin-top:8px;">
+                    <span class="si-muted">Header → field aliases (one per line: field: label, label)</span>
+                    <textarea class="si-input" data-react-config="aliasesText" rows="7" style="margin-top:2px;width:100%;resize:vertical;font-size:11px;">${escapeHtml(state.reactConfig.aliasesText)}</textarea>
+                  </div>
+                  <button class="si-btn" id="si-react-config-reset" style="margin-top:6px;padding:4px 8px;font-size:11px;">Reset defaults</button>
+                </div>
+              ` : ''}
               <div class="si-grid-2">
                 <div>
                   <span class="si-muted">Injection Pace</span>
@@ -2193,6 +2504,14 @@
       });
     });
 
+    shadow.querySelectorAll('[data-col-mode]').forEach((sel) => {
+      sel.addEventListener('change', (e) => {
+        const header = sel.getAttribute('data-col-mode');
+        state.reactColumnModes[header] = e.target.value;
+        saveReactConfig();
+      });
+    });
+
     const pickAddBtn = shadow.getElementById('si-pick-add');
     if (pickAddBtn) {
       pickAddBtn.addEventListener('dragstart', (e) => {
@@ -2234,7 +2553,61 @@
 
     const modeSel = shadow.getElementById('si-mode-sel');
     if (modeSel) {
-      modeSel.addEventListener('change', (e) => { state.injectionMode = e.target.value; });
+      modeSel.addEventListener('change', (e) => { state.injectionMode = e.target.value; render(); });
+    }
+
+    shadow.querySelectorAll('[data-react-config]').forEach((inp) => {
+      inp.addEventListener('change', (e) => {
+        state.reactConfig[e.target.getAttribute('data-react-config')] = e.target.value;
+        saveReactConfig();
+      });
+    });
+
+    const optionKeysInp = shadow.getElementById('si-react-option-keys');
+    if (optionKeysInp) {
+      optionKeysInp.addEventListener('change', (e) => {
+        const parts = String(e.target.value).split(',').map((v) => v.trim()).filter(Boolean);
+        if (parts[0]) state.reactConfig.sousPositionKey = parts[0];
+        if (parts[1]) state.reactConfig.subCategoryKey = parts[1];
+        saveReactConfig();
+      });
+    }
+
+    const idHeadersInp = shadow.getElementById('si-react-id-headers');
+    if (idHeadersInp) {
+      idHeadersInp.addEventListener('change', (e) => {
+        state.reactConfig.idHeaderLabels = e.target.value;
+        saveReactConfig();
+      });
+    }
+
+    const subFieldsInp = shadow.getElementById('si-react-sub-fields');
+    if (subFieldsInp) {
+      subFieldsInp.addEventListener('change', (e) => {
+        const parts = String(e.target.value).split(',').map((v) => v.trim()).filter(Boolean);
+        if (parts[0]) state.reactConfig.subCategoryField = parts[0];
+        if (parts[1]) state.reactConfig.sousPositionField = parts[1];
+        saveReactConfig();
+      });
+    }
+
+    const countryFieldsInp = shadow.getElementById('si-react-country-fields');
+    if (countryFieldsInp) {
+      countryFieldsInp.addEventListener('change', (e) => {
+        const parts = String(e.target.value).split(',').map((v) => v.trim()).filter(Boolean);
+        if (parts[0]) state.reactConfig.countryExportField = parts[0];
+        if (parts[1]) state.reactConfig.countryImportField = parts[1];
+        saveReactConfig();
+      });
+    }
+
+    const resetReactCfgBtn = shadow.getElementById('si-react-config-reset');
+    if (resetReactCfgBtn) {
+      resetReactCfgBtn.addEventListener('click', () => {
+        state.reactConfig = { ...DEFAULT_REACT_CONFIG };
+        saveReactConfig();
+        render();
+      });
     }
 
     const offsetInp = shadow.getElementById('si-offset-inp');
